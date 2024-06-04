@@ -30,11 +30,6 @@ function eachpixel(pixels)
 	eachcol(reshape(pixels, (c, h * w)))
 end
 
-# ╔═╡ 966257ac-088e-45ab-9516-f91cdc0a5467
-function distance(x, y)
-	norm(x .- y)
-end
-
 # ╔═╡ 91d427bb-fc60-4745-817a-1e1a1282f283
 # modifies probs:
 #   P(i, x, y) = pixel at (x, y) belongs to ith gaussian
@@ -76,7 +71,7 @@ function gmm_3d(pixels, N)
 
 	probs = estep(pixels, means, stds, N)
 	t = 0
-	while t < 30
+	while t < 50
 		t += 1
 		new_probs = estep(pixels, means, stds, N)
 		new_means, new_stds = mstep(pixels, new_probs, N)
@@ -94,20 +89,27 @@ end
 
 # ╔═╡ b3901ffe-4ef7-4e4f-912b-7d494278f540
 begin
-	N = 5
+	N = 10
 	means, stds, probs = gmm_3d(pixels, N)
 	colorview(Lab, means)
 end
 
 # ╔═╡ fad98763-e4b1-4299-a967-5de88a0fa087
 begin
-	images = [colorview(Gray, mean(probs[i, :, :, :], dims=1)[1, :, :]) for i in 1:N]
+	masks = [colorview(Gray, mean(probs[i, :, :, :], dims=1))[1, :, :] for i in 1:N]
 	colors = [fill(colorview(Lab, means[:, i])[1], (h, w)) for i in 1:N]
-	mosaicview(images..., colors...; ncol=N, rowmajor=true)
+	images = [colorview(Lab, mean(probs[i, :, :, :], dims=1) .* pixels) for i in 1:N]
+	mosaicview(masks..., colors..., images...; ncol=N, rowmajor=true)
+end
+
+# ╔═╡ 3be1218f-f18b-4b68-9a78-b34a16dc6ca6
+begin
+	new_means = means[:, :]
+	new_means[:, 1] = [50, 0, -40]
 end
 
 # ╔═╡ 9aead989-5eb6-4460-9422-df92baf2bc21
-colorview(Lab, sum([probs[i, :, :, :] .* means[:, i] for i in 1:N]))
+colorview(Lab, sum([probs[i, :, :, :] .* new_means[:, i] for i in 1:N]))
 
 # ╔═╡ b1b8834c-8788-4a87-9dc4-c7aa56d7faa2
 begin
@@ -1279,12 +1281,12 @@ version = "17.4.0+2"
 # ╠═e7816f7c-1cea-4e5d-93a8-bf01badf4b72
 # ╠═c15fde88-3d0c-46d5-99d1-81a8f9d41585
 # ╠═1dfebc3a-8cda-43fb-adfd-6a444039e25f
-# ╠═966257ac-088e-45ab-9516-f91cdc0a5467
 # ╠═91d427bb-fc60-4745-817a-1e1a1282f283
 # ╠═219031ce-76c7-4c61-960b-240d986d783f
 # ╠═f28f2393-c45a-4410-b2f7-4b39891277b7
 # ╠═b3901ffe-4ef7-4e4f-912b-7d494278f540
 # ╠═fad98763-e4b1-4299-a967-5de88a0fa087
+# ╠═3be1218f-f18b-4b68-9a78-b34a16dc6ca6
 # ╠═9aead989-5eb6-4460-9422-df92baf2bc21
 # ╠═b1b8834c-8788-4a87-9dc4-c7aa56d7faa2
 # ╠═50a170ca-1c96-43e1-9fe6-c4a8432e7f9a
