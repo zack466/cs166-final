@@ -4,423 +4,161 @@
 using Markdown
 using InteractiveUtils
 
-# ╔═╡ 0b5e9f7e-2206-11ef-0888-271226456a50
+# ╔═╡ 0a3b04d2-2350-11ef-2547-7d996bd9c6d4
 using Images, FileIO, ImageSegmentation, Statistics, Profile, ShiftedArrays, Random
 
-# ╔═╡ 86874a6c-aeae-4ab5-bc21-161806d470f2
-# reads the pixels of an image into the LAB colorspace
-function imread(path)
-	img = Lab.(load(path))
-	channelview(img)[:, :, :]
-end
+# ╔═╡ 80e0b2c9-29fb-46fa-ab49-060e58b736c3
+include("gmm.jl")
 
-# ╔═╡ 0d161a18-0a4e-47bb-a190-dca4b7cbc50f
+# ╔═╡ d4c91c42-efa9-4020-806e-576fd16fa150
+pixels = imread("images/man.png")
+
+# ╔═╡ f59d4a9c-6cf1-4b45-8888-9c4f6ecd487d
+grey = greyscale(pixels)
+
+# ╔═╡ abbf0824-bdaf-4eb4-a493-affa893c5b85
+colorview(Lab, grey)
+
+# ╔═╡ 56f98429-d191-4dd1-ab66-0e677433db58
+g = gmm_3d_spatial(grey, 3)
+
+# ╔═╡ 48c562ef-0d3d-4ad6-a35e-1d917d4fb0f9
+show_segments(grey, g)
+
+# ╔═╡ ac28adde-b2a3-4bb0-aad6-a4b411878f59
 begin
-	pixels = imread("./images/brady-lowres.png")
-	colorview(Lab, pixels)
-end
-
-# ╔═╡ 2e68a4ad-96e3-4074-91ee-3990438e15e6
-function greyscale(pixels)
-	pixels = copy(pixels)
-	pixels[2:3, :, :] .= 1e-9
-	pixels
-end
-
-# ╔═╡ 5e092600-83ea-44b1-91f3-47f2116d7f18
-mutable struct GMM
-	N::Integer
-	probs::Array{Float64, 4}   # N x c x h x w
-	means::Array{Float64, 2}   # 3 x N
-	stds::Array{Float64, 2}    # 3 x N
-end
-
-# ╔═╡ bc679198-c5e8-41ac-8ef7-d7661ad6038c
-function gmm(c, h, w, N)
-	means = zeros(3, N)
-	stds = zeros(3, N)
-	probs = ones(N, c, h, w) ./ N
-	return GMM(N, probs, means, stds)
-end
-
-# ╔═╡ 402dace5-374a-4625-ad22-5735302f912f
-# Generates a new GMM with the same array of source pixels
-# Note: no memory is copied - this is to easily generate new GMM states with the same shape
-function clone(g::GMM)
-	N, c, h, w = size(g.probs)
-	gmm(c, h, w, N)
-end
-
-# ╔═╡ d4918689-d708-4b31-9b6c-c11debada46c
-begin
-	function diff(a::Array, b::Array)
-		abs(sum(a .- b .+ 1e-9) / sum(a .+ 1e-9))
-	end
-	
-	function diff(g1::GMM, g2::GMM)
-		return diff(g1.means, g2.means) + diff(g1.stds, g2.stds)
-	end
-end
-
-# ╔═╡ c15fde88-3d0c-46d5-99d1-81a8f9d41585
-# given an image of shape (C, H, W), return an iterator over each pixel, with position information
-function eachpixel_pos(pixels)
-	eachslice(pixels, dims=(2, 3))
-end
-
-# ╔═╡ 1dfebc3a-8cda-43fb-adfd-6a444039e25f
-# given an image of shape (C, H, W), return an iterator over each pixel (without position information)
-function eachpixel(pixels)
-	c, h, w = size(pixels)
-	eachcol(reshape(pixels, (c, h * w)))
-end
-
-# ╔═╡ 2f66281b-2ce5-4f66-929f-314ff4b9810b
-# a baseline: using k-means clustering instead of GMMs
-function gmm_kmeans(pixels, N)
-	c, h, w = size(pixels)
-	K = kmeans(stack(eachpixel(pixels)), N)
-	g = gmm(c, h, w, N)
-	g.means = K.centers
-	g.stds = hcat([
-		stdm(getindex(eachpixel(pixels), findall(==(i), K.assignments)), K.centers[:, i])
-		for i in 1:N
-	]...)
-	g.probs = zeros(size(g.probs))
-	for i in 1:N
-		idxs = findall(==(i), reshape(K.assignments, h, w))
-		v = @view g.probs[i, :, :, :]
-		v[:, idxs] .= 1
-	end
-	g
-end
-
-# ╔═╡ 823c6598-cd39-4164-96e8-5fa25ed6b48b
-gk = gmm_kmeans(pixels, 10)
-
-# ╔═╡ 91d427bb-fc60-4745-817a-1e1a1282f283
-# modifies probs:
-#   P(i, x, y) = pixel at (x, y) belongs to ith gaussian
-function estep(pixels, g::GMM)
 	new_g = clone(g)
-	for i in 1:g.N
-		new_g.probs[i, :, :, :] = exp.(-((pixels .- g.means[:, i]).^2 ./ (2 .* g.stds[:, i].^2))) .+ 1e-9
-	end
-	new_g.probs = new_g.probs ./ sum(new_g.probs, dims=1)
-	new_g.means = g.means
-	new_g.stds = g.stds
-	return new_g
-end
-
-# ╔═╡ 219031ce-76c7-4c61-960b-240d986d783f
-# modifies means/stds:
-#   re-estimates the means/stds of each gaussian
-# function mstep(pixels, probs, N)
-function mstep(pixels, g)
-	new_g = clone(g)
-	for i in 1:g.N
-		Z = sum(g.probs[i, :, :, :], dims=(2, 3))
-		new_g.means[:, i] = sum(g.probs[i, :, :, :] .* pixels, dims=(2, 3)) ./ Z
-		new_g.stds[:, i] = (sum(g.probs[i, :, :, :] .* (pixels .- g.means[:, i]).^2, dims=(2, 3)) ./ Z) .^ 0.5
-	end
-	new_g.probs = g.probs
-	return new_g
-end
-
-# ╔═╡ f28f2393-c45a-4410-b2f7-4b39891277b7
-# Can be initialized randomly or using kmeans clustering
-function gmm_3d(pixels, N; init=:kmeans, ϵ=0.005)
-	c, h, w = size(pixels)
-	g = gmm(c, h, w, N)
-
-	if init == :kmeans
-		# initializes means as kmean centroids
-		K = kmeans(stack(eachpixel(pixels)), N)
-		g.means = K.centers
-		g.stds = hcat([
-			stdm(getindex(eachpixel(pixels), findall(==(i), K.assignments)), K.centers[:, i])
-			for i in 1:N
-		]...)
-		# initialize probabilities
-		g = estep(pixels, g)
-	else
-		# randomly initialize weights
-		g.probs = ones(N, c, h, w) ./ N
-		# initializes means/stds based on weights
-		g = mstep(pixels, g)
-	end
-	
-	t = 0
-	while t < 100
-		t += 1
-		g1 = estep(pixels, g)
-		g2 = mstep(pixels, g1)
-		
-		d = diff(g, g2)
-
-		g = g2
-
-		@info "Step $(t): d=$(d)"
-		if d < ϵ
-			break
-		end
-	end
-	@info "EM: $(t) iterations"
-	g
-end
-
-# ╔═╡ b3901ffe-4ef7-4e4f-912b-7d494278f540
-begin
-	g = gmm_3d(pixels, 20)
-	colorview(Lab, g.means)
-end
-
-# ╔═╡ 4eec6596-e4c6-431f-9b45-0af7a37741fd
-function show_segments(pixels, g)
-	N, c, h, w = size(g.probs)
-	masks = [colorview(Gray, mean(g.probs[i, :, :, :], dims=1))[1, :, :] for i in 1:N]
-	colors = [fill(colorview(Lab, g.means[:, i])[1], (h, w)) for i in 1:N]
-	images = [colorview(Lab, mean(g.probs[i, :, :, :], dims=1) .* pixels) for i in 1:N]
-	mosaicview(masks..., colors..., images...; ncol=N, rowmajor=true)
-end
-
-# ╔═╡ fad98763-e4b1-4299-a967-5de88a0fa087
-show_segments(pixels, g)
-
-# ╔═╡ 3be1218f-f18b-4b68-9a78-b34a16dc6ca6
-function reconstruct(g)
-	sum([g.probs[i, :, :, :] .* g.means[:, i] for i in 1:g.N])
-end
-
-# ╔═╡ 3e64bc32-3e94-4499-bbe2-855fb1a263a5
-colorview(Lab, reconstruct(gk))
-
-# ╔═╡ 9aead989-5eb6-4460-9422-df92baf2bc21
-colorview(Lab, reconstruct(g))
-
-# ╔═╡ 29dc0195-8c2a-4a54-b4a3-ac7d3b7abe04
-function estep_spatial(pixels, g)
-	new_g = clone(g)
+	new_g.means[:, :] = g.means[:, :]
+	new_g.stds[:, :] = g.stds[:, :]
 	new_g.probs[:, :, :, :] = g.probs[:, :, :, :]
-	for i in 1:g.N
-		new_g.probs[i, :, :, :] += exp.(-((pixels .- g.means[:, i]).^2 ./ (2 .* g.stds[:, i].^2))) .+ 1e-9
-	end
-	new_g.probs = new_g.probs ./ sum(new_g.probs, dims=1)
-	new_g.means = g.means
-	new_g.stds = g.stds
-	return new_g
+	new_g.means[2:3, 3] .= [100, 0]
+	new_g.stds[1, 2] = 0.1
+	new_g.means[2:3, 2] .= [-100, 0]
+	new_g.stds[1, 1] = 5
+	new_g.means[2:3, 1] .= [10, 0]
 end
 
-# ╔═╡ 3578e246-6bdd-4256-ab0a-9e931e5cd9a0
-# returns the offsets for each neighbor (all possible offsets except (0, 0))
-function neighbors(Ns)
-	Iterators.product(-Ns:Ns, -Ns:Ns) |> itr ->
-	Iterators.filter(x -> !(x[1] == 0 && x[2]==0), itr)
-end
+# ╔═╡ b2935304-2890-477e-9f3a-10590fbb3fe8
+colorview(Lab, composite(grey, Dict(zip(1:g.N, 1:g.N)), g, new_g))
 
-# ╔═╡ 6faacf0d-a413-4e3b-89a8-658dfaf48647
-# smooths over the distribution using a bilateral filter
-#   Ns  - neighborhood size
-#   σd - spatial smoothing factor
-#   σg - color smoothing factor
-function spatial_smoothing(pixels, g; Ns=2, σd=5, σg=5)
-	# construct new probability maps for each possible neighbor offset (with zero-padding)
-	N, c, h, w = size(g.probs)
-	neighbor_maps = []
-	for (dx, dy) in neighbors(Ns)
-		shifted = ShiftedArray(pixels, (0, dx, dy), default=0)
-		D1 = exp.(-((pixels - shifted).^2) ./ σg)
-		D2 = fill(exp(-(dx^2 + dy^2) / σd), size(pixels))
-		D = D1 .* D2
-		probs_shifted = ShiftedArray(g.probs, (0, 0, dx, dy), default=0)
-		res = reshape(D, 1, c, h, w) .* probs_shifted
-		push!(neighbor_maps, res)
-	end
-	result = sum(neighbor_maps) .+ 1e-9
-	result = result ./ sum(result, dims=1)
-	new_g = clone(g)
-	new_g.probs = result
-	new_g.stds = g.stds
-	new_g.means = g.means
-	return new_g
-end
+# ╔═╡ d256e2e1-6fe1-40d0-8e5d-054ff19a882c
+mosaicview(colorview(Lab, grey), colorview(Lab, composite(grey, Dict(zip(1:g.N, 1:g.N)), g, new_g)), ncol=2)
 
-# ╔═╡ 6eab550e-6b94-4eb3-add3-fcc45cb287d6
-function merge(pixels, g; δ=1)
-	new_g = clone(g)
-	new_g.probs = g.probs
-	new_g.means = g.means
-	new_g.stds = g.stds
-	new_g.N = g.N
-	while true
-		done = true
-		all_pairs = Iterators.product(1:new_g.N, 1:new_g.N) |> x -> Iterators.filter(x -> x[1] < x[2], x)
-		for (i, j) in all_pairs
-			if mean(abs.(new_g.means[:, i] .- new_g.means[:, j])) < δ
-				# merge gaussians i and j
-				# merge the probabilities and then re-estimate parameters
-				new_g.N -= 1
-				new_probs = vcat(new_g.probs[1:(j-1), :, :, :], new_g.probs[(j+1):(new_g.N+1), :, :, :])
-				new_probs[i, :, :, :] = new_g.probs[i, :, :, :] .+ new_g.probs[j, :, :, :]
-				new_g.probs = new_probs
-				new_g = spatial_smoothing(pixels, new_g)
-				new_g = mstep(pixels, new_g)
-				done = false
-				break
-			end
-		end
-		if done
-			break
-		end
-	end
-	return new_g
-end
+# ╔═╡ d25c9b5e-788a-431c-8a86-68b60a5a4009
+g2 = gmm_3d_spatial(pixels, 3)
 
-# ╔═╡ 50a170ca-1c96-43e1-9fe6-c4a8432e7f9a
-function gmm_3d_spatial(pixels, N; init=:kmeans, ϵ=0.005, merge_t=5)
-	c, h, w = size(pixels)
-	g = gmm(c, h, w, N)
+# ╔═╡ 306153c5-f6d6-4b27-a6ea-1b08e5f758df
+show_segments(pixels, g2)
 
-	if init == :kmeans
-		# initializes means as kmean centroids
-		K = kmeans(stack(eachpixel(pixels)), N)
-		g.means = K.centers
-		g.stds = hcat([
-			stdm(getindex(eachpixel(pixels), findall(==(i), K.assignments)), K.centers[:, i])
-			for i in 1:N
-		]...)
-		# initialize probabilities
-		g = estep(pixels, g)
-	else
-		# randomly initialize weights
-		g.probs = ones(N, c, h, w) ./ N
-		# initializes means/stds based on weights
-		g = mstep(pixels, g)
-	end
-	
-	t = 0
-	while t < 100
-		t += 1
-		new_g = estep_spatial(pixels, g)
-		new_g = spatial_smoothing(pixels, new_g)
-		new_g = mstep(pixels, new_g)
-		d = diff(g, new_g)
-		
-		if t > merge_t
-			new_g = merge(pixels, new_g)
-		end
-
-		g = new_g
-
-		@info "Step $(t): d=$(d), N=$(g.N)"
-		if t > 5 && d < 0.005
-			break
-		end
-	end
-	@info "EM modified: $(t) iterations"
-	g
-end
-
-# ╔═╡ 63fbbc5b-7588-4d64-9637-33c979e89c5a
+# ╔═╡ 14327844-848b-4913-9155-25a8e838a0d8
 begin
-	g_spatial = gmm_3d_spatial(pixels, 20)
-	colorview(Lab, g_spatial.means)
+	new_g2 = clone(g)
+	new_g2.means[:, :] = g2.means[:, :]
+	new_g2.stds[:, :] = g2.stds[:, :]
+	new_g2.probs[:, :, :, :] = g2.probs[:, :, :, :]
+
+	new_g2.means[2:3, 2] .= [0, -50]
+	new_g2.means[2:3, 3] .= [0, -10]
 end
 
-# ╔═╡ 2912a519-04c5-4342-a7ad-991bac154330
-show_segments(pixels, g_spatial)
+# ╔═╡ a8c486a8-0b80-4c12-b304-5214d3e72e30
+colorview(Lab, composite(pixels, Dict(zip(1:g2.N, 1:g2.N)), g2, new_g2))
 
-# ╔═╡ 1ac8678e-75f9-481c-99c2-d91b5d6aab21
-colorview(Lab, reconstruct(g_spatial))
+# ╔═╡ 159a52d0-063e-4509-9972-47089f38a4d8
+show_segments(pixels, new_g2)
 
-# ╔═╡ a72f6cd5-ea10-4ac8-b530-fdc1073064d3
-# gaussian mapping function without spatial correspondance
-function mapping(g1, g2)
-	map = Dict()
-	for i in 1:g1.N
-		j = argmin(1:g2.N) do j
-			if g1.means[1, i] >= g2.means[1, j]
-				abs(g1.means[1, i] - g2.means[1, j])
-			else
-				1e9
-			end
-		end
-		map[i] = j
-	end
-	return map
-end
+# ╔═╡ d6072df4-7fba-4393-b60c-21c926cbb7ce
+g3 = gmm_3d_spatial(pixels, 6)
 
-# ╔═╡ 1d117de8-7aef-41b4-9a51-19fa759ed02a
-# gaussian mapping function with spatial correspondance
-function mapping_spatial(g1, g2)
-	map = Dict()
-	for i in 1:g1.N
-		j = argmax(1:g2.N) do j
-			p1, p2 = sym_paddedviews(0, g1.probs[i, :, :, :], g2.probs[j, :, :, :])
-			mean(PaddedViews.no_offset_view(p1) .* PaddedViews.no_offset_view(p2))
-		end
-		map[i] = j
-	end
-	return map
-end
+# ╔═╡ ecd980ae-8171-4e65-b20c-05864b76ef2c
+show_segments(pixels, g3)
 
-# ╔═╡ 567d54b9-5229-45d4-b254-38b28e1c56da
-m1 = mapping(g, g)
-
-# ╔═╡ 3f6f2170-d6d5-4d63-a0a1-ca0b412b24f8
-m2 = mapping_spatial(g_spatial, g_spatial)
-
-# ╔═╡ ea7fbb01-de83-4bbd-b02e-6f60a5fd44f9
-function composite(pixels, map, g1, g2)
-	result = zeros(size(pixels))
-	for i in 1:g1.N
-		j = map[i]
-		result[:, :, :] += g1.probs[i] .* ((g2.stds[:, j] ./ g1.stds[:, i]) .* (pixels .- g1.means[:, i]) .+ g2.means[:, j])
-	end
-	return result
-end
-
-# ╔═╡ 4860bf87-c2e6-4897-9c37-108274cafc0d
-m3 = Dict(zip(1:g_spatial.N, shuffle(1:g_spatial.N)))
-
-# ╔═╡ 27ef70c0-07f9-40d2-830c-0a178a6ee55f
-colorview(Lab, composite(pixels, m3, g, g))
-
-# ╔═╡ d89da48d-2870-41e6-acb9-f84f04421e77
-px2 = imread("./images/mona_lisa.jpg")
-
-# ╔═╡ 4b253cc9-8301-4c33-a4b3-93533d5532bd
-g3 = gmm_3d_spatial(px2, 20)
-
-# ╔═╡ 2dc5040e-4818-48e5-b72d-de6d5effa5e9
-map3 = mapping(g_spatial, g3)
-
-# ╔═╡ 43ae80fe-7424-4b48-b87d-c8993e59d03a
-colorview(Lab, composite(pixels, map3, g_spatial, g3))
-
-# ╔═╡ 3824146d-622e-4685-92ac-ca48c0a7c53b
-mosaicview(colorview(Lab, pixels), colorview(Lab, px2); ncol=2)
-
-# ╔═╡ 1c36f5da-8cd6-4149-8322-f87ceb0d08c4
+# ╔═╡ 2e132568-fe56-40bb-9554-2cdd116a4b89
 begin
-	grey = greyscale(pixels)
-	colorview(Lab, grey)
+	new_g3 = clone(g3)
+	new_g3.means[:, :] = g3.means[:, :]
+	new_g3.stds[:, :] = g3.stds[:, :]
+	new_g3.probs[:, :, :, :] = g3.probs[:, :, :, :]
+
+	new_g3.means[2:3, 3] .= [0, -30]
 end
 
-# ╔═╡ bde6befd-d54f-45fa-9211-fbe180480108
-gg = gmm_3d_spatial(grey, 5, merge_t=1e9)
+# ╔═╡ 23cd813f-ea4f-4fe3-8d42-1e9089c3d5a8
+colorview(Lab, composite(pixels, Dict(zip(1:g3.N, 1:g3.N)), g3, new_g3))
 
-# ╔═╡ bdab8d34-ea68-4712-9e2c-3b1eedf29fc9
-colorview(Lab, reconstruct(gg))
+# ╔═╡ 53b952f7-f747-4913-b0fd-61bede0e29e8
+sunset = imread("images/sunset.png")
 
-# ╔═╡ 6a88770f-d82b-46a0-a830-52e29131e28b
-show_segments(grey, gg)
+# ╔═╡ d33d5cb1-922c-4f6b-a3c2-dd71d26c7efb
+g4 = gmm_3d_spatial(sunset, 6)
 
-# ╔═╡ 0d6ae75c-d47d-4595-9f51-7f0a9981c95c
-mmm = mapping(gg, g_spatial)
+# ╔═╡ d54d9d65-10f8-405d-9af2-9268e66b29b7
+show_segments(sunset, g4)
 
-# ╔═╡ b7e4523e-3f9c-4949-ae7d-d701d22cfe97
-colorview(Lab, composite(grey, mmm, gg, g_spatial))
+# ╔═╡ ef32f011-fac4-4166-9dd3-5bec3b557912
+begin
+	new_g4 = clone(g4)
+	new_g4.means[:, :] = g4.means[:, :]
+	new_g4.stds[:, :] = g4.stds[:, :]
+	new_g4.probs[:, :, :, :] = g4.probs[:, :, :, :]
+
+	new_g4.means[2:3, 2] .= [0, -40]
+	new_g4.means[2:3, 3] .= [0, 50]
+	# new_g4.means[2:3, 4] .= [0, 20]
+	new_g4.means[2:3, 5] .= [0, -40]
+end
+
+# ╔═╡ e277e28d-5ba7-46e7-8854-b3f3ba071f5a
+mosaicview(colorview(Lab, sunset), colorview(Lab, composite(sunset, Dict(zip(1:g4.N, 1:g4.N)), g4, new_g4)), ncol=2)
+
+# ╔═╡ 8971f1f7-12c5-459c-a641-e0a3edfb6516
+show_segments(sunset, new_g4)
+
+# ╔═╡ 3c6c41c9-7081-4106-80b1-364ed455f13e
+brady = imread("images/brady.png")
+
+# ╔═╡ ac4e233b-2cc2-48ea-88dd-e09baecb3e96
+g5 = gmm_3d_spatial(brady, 8)
+
+# ╔═╡ 90275436-1aaf-4834-a5b4-c594d702426b
+show_segments(brady, g5)
+
+# ╔═╡ f96a7bc6-c6b3-42f3-ab1b-978b3c947cf9
+begin
+	new_g5 = clone(g5)
+	new_g5.means[:, :] = g5.means[:, :]
+	new_g5.stds[:, :] = g5.stds[:, :]
+	new_g5.probs[:, :, :, :] = g5.probs[:, :, :, :]
+
+	new_g5.means[2:3, 4] .= [-50, 50]
+	new_g5.means[2:3, 2] .= [50, -50]
+	new_g5.means[2:3, 7] .= [10, -10]
+	new_g5.means[2:3, 8] .= [20, -30]
+end
+
+# ╔═╡ a5f28f11-0742-4f7d-9249-7e071f7c7cd8
+mosaicview(colorview(Lab, brady), colorview(Lab, composite(brady, Dict(zip(1:g5.N, 1:g5.N)), g5, new_g5)), ncol=2)
+
+# ╔═╡ 862725ee-2841-4b23-b10b-e4f34fc37b7f
+show_segments(brady, new_g5)
+
+# ╔═╡ 145a0427-7db8-4f9f-9745-160fc5294745
+begin
+	flash = imread("images/cave01_00_flash.jpg")
+	noflash = imread("images/cave01_01_noflash.jpg")
+end
+
+# ╔═╡ 847f876e-ee33-4f79-b129-5d52dc5d6d48
+comp = transfer(flash, noflash, 20)
+
+# ╔═╡ 61a773b6-5bd2-45d3-a0f1-fc71a79e4308
+mosaicview(colorview(Lab, flash), colorview(Lab, noflash), colorview(Lab, comp); ncol=3)
+
+# ╔═╡ 822ee9a4-bcc5-4855-8e0c-16a68a2add89
+colorview(Lab, comp)
+
+# ╔═╡ 56572d14-0bda-481d-b86f-bb98095aff65
+colorview(Lab, greyscale(imread("images/kodim19.png")))
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -1577,52 +1315,41 @@ version = "17.4.0+2"
 """
 
 # ╔═╡ Cell order:
-# ╠═0b5e9f7e-2206-11ef-0888-271226456a50
-# ╠═86874a6c-aeae-4ab5-bc21-161806d470f2
-# ╠═0d161a18-0a4e-47bb-a190-dca4b7cbc50f
-# ╠═2e68a4ad-96e3-4074-91ee-3990438e15e6
-# ╠═5e092600-83ea-44b1-91f3-47f2116d7f18
-# ╠═bc679198-c5e8-41ac-8ef7-d7661ad6038c
-# ╠═402dace5-374a-4625-ad22-5735302f912f
-# ╠═d4918689-d708-4b31-9b6c-c11debada46c
-# ╠═c15fde88-3d0c-46d5-99d1-81a8f9d41585
-# ╠═1dfebc3a-8cda-43fb-adfd-6a444039e25f
-# ╠═2f66281b-2ce5-4f66-929f-314ff4b9810b
-# ╠═823c6598-cd39-4164-96e8-5fa25ed6b48b
-# ╠═3e64bc32-3e94-4499-bbe2-855fb1a263a5
-# ╠═91d427bb-fc60-4745-817a-1e1a1282f283
-# ╠═219031ce-76c7-4c61-960b-240d986d783f
-# ╠═f28f2393-c45a-4410-b2f7-4b39891277b7
-# ╠═b3901ffe-4ef7-4e4f-912b-7d494278f540
-# ╠═4eec6596-e4c6-431f-9b45-0af7a37741fd
-# ╠═fad98763-e4b1-4299-a967-5de88a0fa087
-# ╠═3be1218f-f18b-4b68-9a78-b34a16dc6ca6
-# ╠═9aead989-5eb6-4460-9422-df92baf2bc21
-# ╠═29dc0195-8c2a-4a54-b4a3-ac7d3b7abe04
-# ╠═3578e246-6bdd-4256-ab0a-9e931e5cd9a0
-# ╠═6faacf0d-a413-4e3b-89a8-658dfaf48647
-# ╠═6eab550e-6b94-4eb3-add3-fcc45cb287d6
-# ╠═50a170ca-1c96-43e1-9fe6-c4a8432e7f9a
-# ╠═63fbbc5b-7588-4d64-9637-33c979e89c5a
-# ╠═2912a519-04c5-4342-a7ad-991bac154330
-# ╠═1ac8678e-75f9-481c-99c2-d91b5d6aab21
-# ╠═a72f6cd5-ea10-4ac8-b530-fdc1073064d3
-# ╠═1d117de8-7aef-41b4-9a51-19fa759ed02a
-# ╠═567d54b9-5229-45d4-b254-38b28e1c56da
-# ╠═3f6f2170-d6d5-4d63-a0a1-ca0b412b24f8
-# ╠═ea7fbb01-de83-4bbd-b02e-6f60a5fd44f9
-# ╠═4860bf87-c2e6-4897-9c37-108274cafc0d
-# ╠═27ef70c0-07f9-40d2-830c-0a178a6ee55f
-# ╠═d89da48d-2870-41e6-acb9-f84f04421e77
-# ╠═4b253cc9-8301-4c33-a4b3-93533d5532bd
-# ╠═2dc5040e-4818-48e5-b72d-de6d5effa5e9
-# ╠═43ae80fe-7424-4b48-b87d-c8993e59d03a
-# ╠═3824146d-622e-4685-92ac-ca48c0a7c53b
-# ╠═1c36f5da-8cd6-4149-8322-f87ceb0d08c4
-# ╠═bde6befd-d54f-45fa-9211-fbe180480108
-# ╠═bdab8d34-ea68-4712-9e2c-3b1eedf29fc9
-# ╠═6a88770f-d82b-46a0-a830-52e29131e28b
-# ╠═0d6ae75c-d47d-4595-9f51-7f0a9981c95c
-# ╠═b7e4523e-3f9c-4949-ae7d-d701d22cfe97
+# ╠═0a3b04d2-2350-11ef-2547-7d996bd9c6d4
+# ╠═80e0b2c9-29fb-46fa-ab49-060e58b736c3
+# ╠═d4c91c42-efa9-4020-806e-576fd16fa150
+# ╠═f59d4a9c-6cf1-4b45-8888-9c4f6ecd487d
+# ╠═abbf0824-bdaf-4eb4-a493-affa893c5b85
+# ╠═56f98429-d191-4dd1-ab66-0e677433db58
+# ╠═48c562ef-0d3d-4ad6-a35e-1d917d4fb0f9
+# ╠═ac28adde-b2a3-4bb0-aad6-a4b411878f59
+# ╠═b2935304-2890-477e-9f3a-10590fbb3fe8
+# ╠═d256e2e1-6fe1-40d0-8e5d-054ff19a882c
+# ╠═d25c9b5e-788a-431c-8a86-68b60a5a4009
+# ╠═306153c5-f6d6-4b27-a6ea-1b08e5f758df
+# ╠═14327844-848b-4913-9155-25a8e838a0d8
+# ╠═a8c486a8-0b80-4c12-b304-5214d3e72e30
+# ╠═159a52d0-063e-4509-9972-47089f38a4d8
+# ╠═d6072df4-7fba-4393-b60c-21c926cbb7ce
+# ╠═ecd980ae-8171-4e65-b20c-05864b76ef2c
+# ╠═2e132568-fe56-40bb-9554-2cdd116a4b89
+# ╠═23cd813f-ea4f-4fe3-8d42-1e9089c3d5a8
+# ╠═53b952f7-f747-4913-b0fd-61bede0e29e8
+# ╠═d33d5cb1-922c-4f6b-a3c2-dd71d26c7efb
+# ╠═d54d9d65-10f8-405d-9af2-9268e66b29b7
+# ╠═ef32f011-fac4-4166-9dd3-5bec3b557912
+# ╠═e277e28d-5ba7-46e7-8854-b3f3ba071f5a
+# ╠═8971f1f7-12c5-459c-a641-e0a3edfb6516
+# ╠═3c6c41c9-7081-4106-80b1-364ed455f13e
+# ╠═ac4e233b-2cc2-48ea-88dd-e09baecb3e96
+# ╠═90275436-1aaf-4834-a5b4-c594d702426b
+# ╠═f96a7bc6-c6b3-42f3-ab1b-978b3c947cf9
+# ╠═a5f28f11-0742-4f7d-9249-7e071f7c7cd8
+# ╠═862725ee-2841-4b23-b10b-e4f34fc37b7f
+# ╠═145a0427-7db8-4f9f-9745-160fc5294745
+# ╠═847f876e-ee33-4f79-b129-5d52dc5d6d48
+# ╠═61a773b6-5bd2-45d3-a0f1-fc71a79e4308
+# ╠═822ee9a4-bcc5-4855-8e0c-16a68a2add89
+# ╠═56572d14-0bda-481d-b86f-bb98095aff65
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
